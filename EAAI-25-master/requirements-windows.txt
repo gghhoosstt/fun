@@ -1,7 +1,0 @@
-sklearn
-numpy
-scipy
-tqdm
-boto3=1.9.110
-regex
-requests
