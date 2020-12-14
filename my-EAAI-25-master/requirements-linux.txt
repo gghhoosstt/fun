@@ -1,7 +1,0 @@
-sklearn
-numpy
-scipy
-tqdm
-torch
-boto3
-regex
