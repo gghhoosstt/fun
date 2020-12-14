@@ -39,7 +39,7 @@ from pytorch_pretrained_bert import file_utils#又见了，小伙子
 from pytorch_pretrained_bert import modeling
 from pytorch_pretrained_bert import tokenization
 from pytorch_pretrained_bert import optimization
-
+from torch.nn import functional as f
     #  file_utils里PYTORCH_PRETRAINED_BERT_CACHE, WEIGHTS_NAME, CONFIG_NAME
 
     # modeling.BertForSequenceClassification, BertConfig
@@ -177,9 +177,9 @@ class SASProcessor(DataProcessor):
 
     def get_train_examples(self, data_dir):
         """See base class."""
-        logger.info("LOOKING AT {}".format(os.path.join(data_dir, self.n_way, "train.txt")))
+        logger.info("LOOKING AT {}".format(os.path.join(data_dir, self.n_way, "newtrain.txt")))
         return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, self.n_way, "train.txt")), "train")
+            self._read_tsv(os.path.join(data_dir, self.n_way, "newtrain.txt")), "train")
 
     def get_dev_examples(self, data_dir):
         """See base class."""
@@ -495,6 +495,11 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
     sepIndex = []
     seprow = [0]*2
     i = 0
+    # rest =  len(examples) % 16
+    # while(rest != 0):
+    #     examples.pop()#弹出最后一个
+    #     rest-=1
+
     textab = ""
     for (ex_index, example) in enumerate(examples):
         if ex_index % 10000 == 0:
@@ -691,7 +696,7 @@ def compute_metrics(task_name, preds, labels,both_answers):
     else:
         raise KeyError(task_name)
 
-def align(lastEnbedding,sepindex,batch):
+def align(lastEnbedding,sepindex):
     """
     ```python
     1.5 add method
@@ -701,29 +706,36 @@ def align(lastEnbedding,sepindex,batch):
     第i条A索引左闭右开：sep[i][0]+1 ~ sep[i][1]
     RA: LEN(RA)* hiddensize
     A: LEN(A)* hiddensize
-    retrun：dest,二维
+    retrun：dest
         batchsize *  [hiddensize * 2]
     """
-    npylastEnbedding = lastEnbedding.detach().cpu().numpy()
-    des = np.zeros((batch,1536),dtype=float)
-
-    for i in range(batch):
+    # npylastEnbedding = lastEnbedding.detach().cpu().numpy()
+    des = torch.zeros((len(lastEnbedding),1536))
+    des = des.float()#转化成浮点型tensor
+    for i in range(len(sepindex)):
         raindex = sepindex[i][0]
         aindex = sepindex[i][1]
-        RA =  npylastEnbedding[i][1:raindex]
-        A = npylastEnbedding[i][raindex+1:aindex]
-        # print(np.shape(npylastEnbedding))
-        # print(np.shape(A))
-        # print(np.shape(RA))
-        alignMatrix = np.dot(A,RA.T)
+        RA = lastEnbedding[i][1:raindex]
+        A = lastEnbedding[i][raindex+1:aindex]
+        # print("A SHAPE",A.size())
+        # print("RA SHAPE",RA.size())
+        alignMatrix = torch.mm(A,RA.T)
         # average pooling
-        raweight = np.mean(alignMatrix,0)#列均值，得到列维度的一维数组
-        aweight = np.mean(alignMatrix,1)#行均值，得到行维度的一维数组。
-        avector = np.dot(aweight,A)
-        ravector = np.dot(raweight,RA)
-        des[i] = np.r_[avector,ravector]#按列拼接
-    dest = torch.Tensor(des)
-    return dest
+        raweight = torch.mean(alignMatrix,0)#列均值，得到列维度的一维数组
+        f.softmax(raweight,dim=0)
+        raweight = raweight.unsqueeze(0)
+        aweight = torch.mean(alignMatrix,1)#行均值，得到行维度的一维数组。
+        f.softmax(aweight,dim=0)
+        aweight = aweight.unsqueeze(0) #在0维扩展，变成1 * len(A)
+        avector = torch.mm(aweight,A)
+        ravector = torch.mm(raweight,RA)
+
+        # print("A SHAPE",avector.size())
+        # print("RA SHAPE",ravector.size())
+
+        des[i] = torch.cat((avector,ravector),-1)#按行拼接-1，按列拼接是0,按列成2维，再压缩成一维一样
+        des = des.cuda()
+    return des
 
 
 
@@ -893,7 +905,7 @@ def main():
     logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -  %(lineno)s -   %(message)s',
                         datefmt = '%m/%d/%Y %H:%M:%S',
                         level = logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
-                        filename = "D:\PythonProject\my-EAAI-25-master\log\mylog.txt"
+                        filename = "/home/gylv/EAAI-25-master/log/mylog.txt"
                         )
 
 
@@ -1010,6 +1022,7 @@ def main():
         """
         train_features,both_answers,train_sep = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer, output_mode)
+        # print("train数据条数",len(train_examples))
         logger.info("***** Running training *****")
         logger.info("  Num examples = %d", len(train_examples))
         logger.info("  Batch size = %d", args.train_batch_size)
@@ -1036,7 +1049,6 @@ def main():
         #加载testdata
     if args.do_eval and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
         eval_examples = processor.get_dev_examples(args.test_data_dir)
-
         eval_features,both_answers,test_sep = convert_examples_to_features(
             eval_examples, label_list, args.max_seq_length, tokenizer, output_mode)
         logger.info("***** Running evaluation *****")
@@ -1058,13 +1070,13 @@ def main():
         # Run prediction for full data
         eval_sampler = SequentialSampler(eval_data)
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.eval_batch_size)
-        #加载dev data
+        #加载valid data
     if args.do_eval and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
         valid_examples = processor.get_valid_examples(args.valid_data_dir)
 
         valid_features,both_answers,valid_sep= convert_examples_to_features(
             valid_examples, label_list, args.max_seq_length, tokenizer, output_mode)
-        print("valid_features len", len(valid_features))
+
         logger.info("***** Running validation *****")
         logger.info("  Num examples = %d", len(valid_examples))
         logger.info("  Batch size = %d", args.eval_batch_size)
@@ -1107,6 +1119,7 @@ def main():
             for step, batch in enumerate(pbar):
                 batch = tuple(t.to(device) for t in batch)#t.to(device)把t复制一份到指定的gpu
                 input_ids, input_mask, segment_ids, label_ids = batch
+                # print("label_ids.size()", label_ids.size())
                 # logger.info("iteration = %d", step)
                 # logger.info(pbar.set_description("iteration"))
                 """
@@ -1115,15 +1128,14 @@ def main():
                 finalMatrix: hiddensize * batchsize * 2
                 """
                 # logits = model(input_ids, segment_ids, input_mask, labels=None)
+
                 lastEnbedding = model(input_ids, segment_ids, input_mask, labels=None)
-
-
                 start = step*args.train_batch_size
-                finalMatrix = align(lastEnbedding = lastEnbedding,sepindex=train_sep[start:start+16],
-                                    batch = args.train_batch_size)
+                finalMatrix = align(lastEnbedding = lastEnbedding,sepindex=train_sep[start:start+len(lastEnbedding)])
                 finalMatrix = model.dropout(finalMatrix) # 16 * (768* 2)
-                logits = model.classifier(finalMatrix)# 16 * (768* 2)
-
+                logits = model.classifier(finalMatrix)# 16 * (768* 2),输入必须是2维
+                # print("train_sep len",len(train_sep))
+                # print("train_example len",len(train_examples))
 
                 """
                  end modify 1.5
@@ -1134,14 +1146,13 @@ def main():
                 else:
                     train_preds[0] = np.append(train_preds[0], logits.view(-1, num_labels).data.cpu().numpy(), axis=0)
 
-                # 计算该batch内损失，分两种情况1 分类问题用交叉熵损失， 2 回归问题用
                 if output_mode == "classification":
                     loss_fct = CrossEntropyLoss()
+
                     loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
                 elif output_mode == "regression":
                     loss_fct = MSELoss()
                     loss = loss_fct(logits.view(-1), label_ids.view(-1))
-
                 if n_gpu > 1:
                     loss = loss.mean()# mean() to average on multi-gpu.
                 if args.gradient_accumulation_steps > 1:
@@ -1165,7 +1176,7 @@ def main():
                             param_group['lr'] = lr_this_step
                     optimizer.step()
                     optimizer.zero_grad()
-                global_step += 1
+                    global_step += 1
             # 求训练集的预测值,在epoch内，epoch的for在第2个tab处
             train_preds = train_preds[0]
             train_preds = np.argmax(train_preds, axis=1)
@@ -1223,8 +1234,6 @@ def main():
             # nb_eval_steps = 0  # 例数
 
             for input_ids, input_mask, segment_ids, label_ids in tqdm(valid_dataloader, desc="validating"):
-
-
                 input_ids = input_ids.to(device)
                 input_mask = input_mask.to(device)
                 segment_ids = segment_ids.to(device)
@@ -1237,16 +1246,23 @@ def main():
                     """
                     lastEnbedding = model(input_ids, segment_ids, input_mask, labels=None)
                     start = step * args.train_batch_size
-                    finalMatrix = align(lastEnbedding=lastEnbedding, sepindex=valid_sep[start:start + 16],
-                                        batch=args.train_batch_size)
+                    # print("before align valid ", np.shape(lastEnbedding))
+                    finalMatrix = align(lastEnbedding=lastEnbedding, sepindex=valid_sep[start:start + len(lastEnbedding)])
+                    # print("after align valid ", len(finalMatrix))
                     finalMatrix = model.dropout(finalMatrix)  # 16 * 768* 2
+                    finalMatrix = finalMatrix.to(device)
                     logits = model.classifier(finalMatrix)  # 16 * 768* 2
 
+                    """
+                     ```end modify 1.5
+                    """
                     # logits = model(input_ids, segment_ids, input_mask, labels=None)
-
+                    # print("valid examples",len(valid_examples))
                 # 计算损失，loss，预测值与真实值的误差。不是acc
                 if output_mode == "classification":
                     loss_fct = CrossEntropyLoss()
+                    # print("validlogits len", len(logits))
+                    # print(" valid labels len", len(label_ids))
                     tmp_valid_loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
                 elif output_mode == "regression":
                     loss_fct = MSELoss()
@@ -1275,8 +1291,6 @@ def main():
             nb_eval_steps = 0 #测试用例数
 
             for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader, desc="Evaluating"):
-
-
                 input_ids = input_ids.to(device)
                 input_mask = input_mask.to(device)
                 segment_ids = segment_ids.to(device)
@@ -1289,9 +1303,10 @@ def main():
                     """
                     lastEnbedding = model(input_ids, segment_ids, input_mask, labels=None)
                     start = step * args.train_batch_size
-                    finalMatrix = align(lastEnbedding=lastEnbedding, sepindex=test_sep[start:start + 16],
-                                        batch=args.train_batch_size)
+                    finalMatrix = align(lastEnbedding=lastEnbedding, sepindex=test_sep[start:start + len(lastEnbedding)])
+                    # print("after align test ", len(finalMatrix))
                     finalMatrix = model.dropout(finalMatrix)  # 16 * 768* 2
+                    finalMatrix = finalMatrix.to(device)
                     logits = model.classifier(finalMatrix)  # 16 * 768* 2
 
                     # logits = model(input_ids, segment_ids, input_mask, labels=None)
@@ -1323,7 +1338,7 @@ def main():
             # both_answers = texta + textb
             test_result = compute_metrics(task_name, preds, all_label_ids.numpy(),both_answers)
             loss = tr_loss/global_step if args.do_train else None
-            preds = []#本epoch清空预测值
+            preds = []  #本epoch清空预测值
             model.train()
             output_eval_file = os.path.join(args.output_dir, "results.txt")
             with open(output_eval_file, "a+") as writer:
